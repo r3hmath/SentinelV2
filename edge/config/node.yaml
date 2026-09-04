@@ -16,7 +16,12 @@ api:
   base_url: http://127.0.0.1:8000
 
 
+# ============================================================
+# YOLO + BYTETRACK
+# ============================================================
+
 inference:
+
   model_path: ./models/yolo26n.pt
 
   confidence: 0.55
@@ -28,28 +33,126 @@ inference:
     - 5
     - 7
 
-  # Tracking configuration
   tracker: bytetrack.yaml
 
-  # YOLO + tracker runs on every frame.
-  # Do NOT skip frames here because tracking requires
-  # a continuous sequence.
   track_every_n_frames: 1
 
-  # How often an existing track is allowed to
-  # generate a TRACK_UPDATE event.
   event_update_interval_seconds: 1.0
 
-  # A track must be seen this many times before
-  # we consider it stable.
   min_track_observations: 2
 
-  # Maximum number of frames a track can disappear
-  # before we consider it ended.
   max_missing_frames: 30
 
-  # YOLO input resolution
   image_size: 640
+
+
+# ============================================================
+# BEHAVIOR ENGINE
+# ============================================================
+
+behavior:
+
+  enabled: true
+
+  event_cooldown_seconds: 10
+
+  loitering:
+
+    enabled: true
+
+    min_duration_seconds: 30
+
+    max_movement_px: 100
+
+    max_speed_px_s: 8
+
+
+  suspicious_stop:
+
+    enabled: true
+
+    min_duration_seconds: 15
+
+    max_speed_px_s: 3
+
+
+  rapid_movement:
+
+    enabled: true
+
+    speed_threshold_px_s: 180
+
+
+  abnormal_direction_change:
+
+    enabled: true
+
+    angle_threshold_degrees: 90
+
+    min_speed_px_s: 10
+
+
+  minimum_observations: 5
+
+
+# ============================================================
+# DECISION ENGINE
+# ============================================================
+
+decision:
+
+  enabled: true
+
+  periodic_inference_seconds: 5.0
+
+  analyze_new_tracks: true
+
+  high_confidence_threshold: 0.85
+
+  rapid_movement_threshold_px_s: 180
+
+  vehicle_types:
+
+    - car
+    - truck
+    - bus
+    - motorcycle
+
+  person_enabled: true
+
+  behavior_priority_enabled: true
+
+  stable_track_observations: 10
+
+
+# ============================================================
+# ALPR
+# ============================================================
+
+alpr:
+
+  enabled: true
+
+  plate_model_path: ./models/license_plate.pt
+
+  detector_confidence: 0.40
+
+  detector_image_size: 640
+
+  ocr_enabled: true
+
+  ocr_gpu: false
+
+  temporal_observations: 10
+
+  temporal_minimum_votes: 2
+
+  analyze_every_n_decisions: 1
+
+
+# ============================================================
+# CAMERA
+# ============================================================
 
 cameras:
 
