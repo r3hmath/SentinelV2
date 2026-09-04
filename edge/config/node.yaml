@@ -1,0 +1,43 @@
+node:
+
+  id: EDGE_AHM_01
+
+  name: Ahmedabad Edge Node
+
+  city: Ahmedabad
+
+  latitude: 23.0225
+
+  longitude: 72.5714
+
+
+api:
+
+  base_url: http://127.0.0.1:8000
+
+
+inference:
+
+  model_path: ./models/yolo26n.pt
+
+  confidence: 0.55
+
+  classes:
+    - 0
+    - 2
+    - 3
+    - 5
+    - 7
+
+  process_every_n_frames: 4
+
+
+cameras:
+
+  - id: CAM_AHM_01
+
+    name: Ahmedabad Demo Camera
+
+    source: ./media/ahmd.mp4
+
+    enabled: true

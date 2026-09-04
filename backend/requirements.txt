@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+asyncpg
+redis
+python-dotenv
+opencv-python
+ultralytics
+requests
+PyYAML

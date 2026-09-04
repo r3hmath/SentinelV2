@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sentinel Event",
+  "type": "object",
+
+  "required": [
+    "event_id",
+    "node_id",
+    "camera_id",
+    "event_type",
+    "timestamp",
+    "confidence"
+  ],
+
+  "properties": {
+
+    "event_id": {
+      "type": "string"
+    },
+
+    "node_id": {
+      "type": "string"
+    },
+
+    "camera_id": {
+      "type": "string"
+    },
+
+    "event_type": {
+      "type": "string"
+    },
+
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+
+    "latitude": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+
+    "longitude": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+
+    "frame_number": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+
+    "inference_latency_ms": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+
+    "detections": {
+      "type": "array"
+    },
+
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

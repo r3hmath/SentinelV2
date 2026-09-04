@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+myenv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+static/
+data/
+tmp/
+
+# Node
+node_modules/
+dist/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Model cache
+.ultralytics/
+
+# Generated files
+*.jpg
+*.jpeg
+*.png
