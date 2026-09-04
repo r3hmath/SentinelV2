@@ -17,7 +17,6 @@ api:
 
 
 inference:
-
   model_path: ./models/yolo26n.pt
 
   confidence: 0.55
@@ -29,8 +28,28 @@ inference:
     - 5
     - 7
 
-  process_every_n_frames: 4
+  # Tracking configuration
+  tracker: bytetrack.yaml
 
+  # YOLO + tracker runs on every frame.
+  # Do NOT skip frames here because tracking requires
+  # a continuous sequence.
+  track_every_n_frames: 1
+
+  # How often an existing track is allowed to
+  # generate a TRACK_UPDATE event.
+  event_update_interval_seconds: 1.0
+
+  # A track must be seen this many times before
+  # we consider it stable.
+  min_track_observations: 2
+
+  # Maximum number of frames a track can disappear
+  # before we consider it ended.
+  max_missing_frames: 30
+
+  # YOLO input resolution
+  image_size: 640
 
 cameras:
 
