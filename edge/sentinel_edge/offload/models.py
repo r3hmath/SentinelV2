@@ -110,26 +110,40 @@ class NodeHealth:
         self.memory_percent = self._clamp_percentage(self.memory_percent)
 
         if self.network_latency_ms < 0:
-            raise ValueError("network_latency_ms cannot be negative")
+            raise ValueError(
+                "network_latency_ms cannot be negative"
+            )
 
         if self.bandwidth_mbps < 0:
-            raise ValueError("bandwidth_mbps cannot be negative")
+            raise ValueError(
+                "bandwidth_mbps cannot be negative"
+            )
 
         if self.queue_depth < 0:
-            raise ValueError("queue_depth cannot be negative")
+            raise ValueError(
+                "queue_depth cannot be negative"
+            )
 
         if self.max_queue_depth <= 0:
-            raise ValueError("max_queue_depth must be greater than zero")
+            raise ValueError(
+                "max_queue_depth must be greater than zero"
+            )
 
     @staticmethod
     def _clamp_percentage(value: float) -> float:
         if not 0 <= value <= 100:
-            raise ValueError("utilization percentage must be between 0 and 100")
+            raise ValueError(
+                "utilization percentage must be between 0 and 100"
+            )
+
         return float(value)
 
     @property
     def queue_utilization(self) -> float:
-        return min(self.queue_depth / self.max_queue_depth, 1.0)
+        return min(
+            self.queue_depth / self.max_queue_depth,
+            1.0,
+        )
 
     @property
     def resource_headroom(self) -> float:
@@ -145,7 +159,9 @@ class NodeHealth:
         ]
 
         if self.gpu_available:
-            values.append(100.0 - self.gpu_percent)
+            values.append(
+                100.0 - self.gpu_percent
+            )
 
         return sum(values) / len(values)
 
@@ -192,19 +208,160 @@ class OffloadDecision:
 
 
 @dataclass(frozen=True)
+class AdaptiveDecisionExplanation:
+    """
+    Explain how adaptive telemetry influenced one node's score.
+
+    The explanation is observational only. It does not participate
+    directly in scheduling.
+    """
+
+    node_id: str
+    target: ExecutionTarget
+
+    base_score: float
+
+    latency_adjustment: float
+    reliability_adjustment: float
+    adaptive_adjustment: float
+
+    final_score: float
+
+    telemetry_samples: int
+    success_rate: float
+    average_latency_ms: float
+
+    adaptation_active: bool
+
+    def __post_init__(self) -> None:
+        if not self.node_id:
+            raise ValueError("node_id must not be empty")
+
+        if self.telemetry_samples < 0:
+            raise ValueError(
+                "telemetry_samples must be >= 0"
+            )
+
+        if not 0.0 <= self.success_rate <= 1.0:
+            raise ValueError(
+                "success_rate must be between 0 and 1"
+            )
+
+        if self.average_latency_ms < 0:
+            raise ValueError(
+                "average_latency_ms must be >= 0"
+            )
+
+        expected_adjustment = (
+            self.latency_adjustment
+            + self.reliability_adjustment
+        )
+
+        if abs(
+            self.adaptive_adjustment
+            - expected_adjustment
+        ) > 1e-9:
+            raise ValueError(
+                "adaptive_adjustment must equal "
+                "latency_adjustment + reliability_adjustment"
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "target": self.target.value,
+            "base_score": round(
+                self.base_score,
+                4,
+            ),
+            "latency_adjustment": round(
+                self.latency_adjustment,
+                4,
+            ),
+            "reliability_adjustment": round(
+                self.reliability_adjustment,
+                4,
+            ),
+            "adaptive_adjustment": round(
+                self.adaptive_adjustment,
+                4,
+            ),
+            "final_score": round(
+                self.final_score,
+                4,
+            ),
+            "telemetry_samples": self.telemetry_samples,
+            "success_rate": round(
+                self.success_rate,
+                4,
+            ),
+            "average_latency_ms": round(
+                self.average_latency_ms,
+                4,
+            ),
+            "adaptation_active": self.adaptation_active,
+        }
+
+
+@dataclass(frozen=True)
+class CandidateExplanation:
+    """
+    Explain one candidate's position in the scheduler ranking.
+    """
+
+    rank: int
+    node_id: str
+    target: ExecutionTarget
+    score: float
+
+    adaptive_explanation: AdaptiveDecisionExplanation | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "rank": self.rank,
+            "node_id": self.node_id,
+            "target": self.target.value,
+            "score": round(
+                self.score,
+                4,
+            ),
+            "adaptive_explanation": (
+                self.adaptive_explanation.to_dict()
+                if self.adaptive_explanation is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class SchedulingResult:
     """
     Complete scheduling response.
 
     This wraps the decision and exposes the nodes considered by
-    the scheduler.
+    the scheduler together with optional adaptive observability.
     """
 
     decision: OffloadDecision
     considered_nodes: tuple[str, ...]
 
+    adaptive_explanation: AdaptiveDecisionExplanation | None = None
+
+    candidate_explanations: tuple[CandidateExplanation, ...] = ()
+
     def to_dict(self) -> dict:
         return {
             "decision": self.decision.to_dict(),
-            "considered_nodes": list(self.considered_nodes),
+            "considered_nodes": list(
+                self.considered_nodes
+            ),
+            "adaptive_explanation": (
+                self.adaptive_explanation.to_dict()
+                if self.adaptive_explanation is not None
+                else None
+            ),
+            "candidate_explanations": [
+                explanation.to_dict()
+                for explanation in self.candidate_explanations
+            ],
         }

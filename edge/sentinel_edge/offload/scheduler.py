@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sentinel_edge.offload.health import NodeHealthRegistry
 from sentinel_edge.offload.models import (
+    CandidateExplanation,
     ExecutionTarget,
     NodeHealth,
     OffloadDecision,
@@ -10,24 +11,31 @@ from sentinel_edge.offload.models import (
     WorkloadProfile,
 )
 from sentinel_edge.offload.policy import SchedulingPolicy
-from sentinel_edge.offload.adaptive_policy import AdaptiveSchedulingPolicy
-from sentinel_edge.offload.telemetry import ExecutionTelemetryCollector
+from sentinel_edge.offload.adaptive_policy import (
+    AdaptiveSchedulingPolicy,
+)
+from sentinel_edge.offload.telemetry import (
+    ExecutionTelemetryCollector,
+)
+
 
 class OffloadScheduler:
     """
     Dynamic Edge / Local / Cloud workload scheduler.
 
-    The scheduler itself is deliberately stateless. Current node
-    state is provided by NodeHealthRegistry, while the decision
-    algorithm lives in SchedulingPolicy.
+    The scheduler is responsible for candidate selection and
+    deterministic decision-making. Execution remains the responsibility
+    of the execution router.
     """
 
     def __init__(
-    self,
-    health_registry: NodeHealthRegistry | None = None,
-    policy: SchedulingPolicy | None = None,
-    telemetry_collector: ExecutionTelemetryCollector | None = None,
-) -> None:
+        self,
+        health_registry: NodeHealthRegistry | None = None,
+        policy: SchedulingPolicy | None = None,
+        telemetry_collector: (
+            ExecutionTelemetryCollector | None
+        ) = None,
+    ) -> None:
         self.health_registry = health_registry
 
         base_policy = policy or SchedulingPolicy()
@@ -42,12 +50,16 @@ class OffloadScheduler:
 
         self.telemetry_collector = telemetry_collector
 
+    # ------------------------------------------------------------------
+    # Public scheduling API
+    # ------------------------------------------------------------------
+
     def schedule(
         self,
         workload: WorkloadProfile,
     ) -> SchedulingResult:
         """
-        Select the best currently available node.
+        Select the best currently available execution node.
         """
 
         nodes = self.health_registry.available_nodes()
@@ -56,6 +68,18 @@ class OffloadScheduler:
             node.node_id
             for node in nodes
         )
+
+        if not self.policy.validate_workload(
+            workload
+        ):
+            return self._rejected_decision(
+                workload=workload,
+                considered_nodes=considered_nodes,
+                reason=(
+                    "Invalid workload constraints; "
+                    "no scheduling decision can be made"
+                ),
+            )
 
         candidates = [
             node
@@ -72,21 +96,9 @@ class OffloadScheduler:
                 considered_nodes=considered_nodes,
             )
 
-        ranked = sorted(
+        ranked = self._rank_candidates(
             candidates,
-            key=lambda node: (
-                self.policy.score(
-                    node,
-                    workload,
-                ),
-                self._target_tiebreaker(
-                    node.target,
-                    workload.priority,
-                ),
-                -node.network_latency_ms,
-                -node.queue_depth,
-            ),
-            reverse=True,
+            workload,
         )
 
         selected = ranked[0]
@@ -103,9 +115,11 @@ class OffloadScheduler:
             workload_type=workload.workload_type,
             priority=workload.priority,
             score=score,
-            estimated_latency_ms=self.policy.estimate_latency(
-                selected,
-                workload,
+            estimated_latency_ms=(
+                self.policy.estimate_latency(
+                    selected,
+                    workload,
+                )
             ),
             reason=self.policy.reason(
                 selected,
@@ -121,6 +135,18 @@ class OffloadScheduler:
         return SchedulingResult(
             decision=decision,
             considered_nodes=considered_nodes,
+            adaptive_explanation=(
+                self._adaptive_explanation(
+                    selected,
+                    workload,
+                )
+            ),
+            candidate_explanations=(
+                self._candidate_explanations(
+                    ranked,
+                    workload,
+                )
+            ),
         )
 
     def schedule_with_preferred_target(
@@ -129,10 +155,9 @@ class OffloadScheduler:
         preferred_target: ExecutionTarget,
     ) -> SchedulingResult:
         """
-        Try a preferred execution target first.
+        Prefer a requested target when capable.
 
-        If the preferred target cannot execute the workload,
-        automatically falls back to the best capable target.
+        Otherwise select the best valid fallback candidate.
         """
 
         nodes = self.health_registry.available_nodes()
@@ -142,24 +167,37 @@ class OffloadScheduler:
             for node in nodes
         )
 
+        if not self.policy.validate_workload(
+            workload
+        ):
+            return self._rejected_decision(
+                workload=workload,
+                considered_nodes=considered_nodes,
+                reason=(
+                    "Invalid workload constraints; "
+                    "preferred-target scheduling rejected"
+                ),
+            )
+
         preferred_candidates = [
             node
             for node in nodes
-            if node.target == preferred_target
-            and self.policy.is_capable(
-                node,
-                workload,
+            if (
+                node.target == preferred_target
+                and self.policy.is_capable(
+                    node,
+                    workload,
+                )
             )
         ]
 
         if preferred_candidates:
-            selected = max(
+            ranked = self._rank_candidates(
                 preferred_candidates,
-                key=lambda node: self.policy.score(
-                    node,
-                    workload,
-                ),
+                workload,
             )
+
+            selected = ranked[0]
 
             decision = OffloadDecision(
                 target=selected.target,
@@ -171,9 +209,11 @@ class OffloadScheduler:
                     selected,
                     workload,
                 ),
-                estimated_latency_ms=self.policy.estimate_latency(
-                    selected,
-                    workload,
+                estimated_latency_ms=(
+                    self.policy.estimate_latency(
+                        selected,
+                        workload,
+                    )
                 ),
                 reason=(
                     f"Preferred target "
@@ -182,13 +222,25 @@ class OffloadScheduler:
                 fallback_used=False,
                 candidates=tuple(
                     node.node_id
-                    for node in preferred_candidates
+                    for node in ranked
                 ),
             )
 
             return SchedulingResult(
                 decision=decision,
                 considered_nodes=considered_nodes,
+                adaptive_explanation=(
+                    self._adaptive_explanation(
+                        selected,
+                        workload,
+                    )
+                ),
+                candidate_explanations=(
+                    self._candidate_explanations(
+                        ranked,
+                        workload,
+                    )
+                ),
             )
 
         fallback_result = self.schedule(
@@ -221,6 +273,54 @@ class OffloadScheduler:
         return SchedulingResult(
             decision=fallback_decision,
             considered_nodes=considered_nodes,
+            adaptive_explanation=(
+                fallback_result.adaptive_explanation
+            ),
+            candidate_explanations=(
+                fallback_result.candidate_explanations
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Candidate ranking
+    # ------------------------------------------------------------------
+
+    def _rank_candidates(
+        self,
+        candidates: list[NodeHealth],
+        workload: WorkloadProfile,
+    ) -> list[NodeHealth]:
+        """
+        Produce a deterministic candidate ordering.
+
+        Ranking priority:
+
+        1. Final scheduling score
+        2. Target suitability for workload priority
+        3. Lower estimated latency
+        4. Lower queue depth
+        5. Stable node ID
+        """
+
+        return sorted(
+            candidates,
+            key=lambda node: (
+                self.policy.score(
+                    node,
+                    workload,
+                ),
+                self._target_tiebreaker(
+                    node.target,
+                    workload.priority,
+                ),
+                -self.policy.estimate_latency(
+                    node,
+                    workload,
+                ),
+                -node.queue_depth,
+                node.node_id,
+            ),
+            reverse=True,
         )
 
     @staticmethod
@@ -229,16 +329,24 @@ class OffloadScheduler:
         priority: Priority,
     ) -> float:
         """
-        Deterministic tie-breaker.
-
-        For equal scores, critical/high workloads prefer Edge/Local
-        over Cloud.
+        Deterministic priority-aware target ordering.
         """
 
-        if priority in {
-            Priority.HIGH,
-            Priority.CRITICAL,
-        }:
+        if priority == Priority.CRITICAL:
+            return {
+                ExecutionTarget.EDGE: 3.0,
+                ExecutionTarget.LOCAL: 2.0,
+                ExecutionTarget.CLOUD: 1.0,
+            }[target]
+
+        if priority == Priority.HIGH:
+            return {
+                ExecutionTarget.EDGE: 3.0,
+                ExecutionTarget.LOCAL: 2.0,
+                ExecutionTarget.CLOUD: 1.0,
+            }[target]
+
+        if priority == Priority.MEDIUM:
             return {
                 ExecutionTarget.EDGE: 3.0,
                 ExecutionTarget.LOCAL: 2.0,
@@ -251,11 +359,64 @@ class OffloadScheduler:
             ExecutionTarget.CLOUD: 1.0,
         }[target]
 
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def _candidate_explanations(
+        self,
+        ranked: list[NodeHealth],
+        workload: WorkloadProfile,
+    ) -> tuple[CandidateExplanation, ...]:
+        return tuple(
+            CandidateExplanation(
+                rank=index,
+                node_id=node.node_id,
+                target=node.target,
+                score=self.policy.score(
+                    node,
+                    workload,
+                ),
+                adaptive_explanation=(
+                    self._adaptive_explanation(
+                        node,
+                        workload,
+                    )
+                ),
+            )
+            for index, node in enumerate(
+                ranked,
+                start=1,
+            )
+        )
+
+    def _adaptive_explanation(
+        self,
+        node: NodeHealth,
+        workload: WorkloadProfile,
+    ):
+        if not isinstance(
+            self.policy,
+            AdaptiveSchedulingPolicy,
+        ):
+            return None
+
+        return self.policy.explain(
+            node,
+            workload,
+        )
+
+    # ------------------------------------------------------------------
+    # Rejection
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _rejected_decision(
         workload: WorkloadProfile,
         considered_nodes: tuple[str, ...],
+        reason: str | None = None,
     ) -> SchedulingResult:
+
         decision = OffloadDecision(
             target=ExecutionTarget.EDGE,
             node_id="NONE",
@@ -265,8 +426,11 @@ class OffloadScheduler:
             score=0.0,
             estimated_latency_ms=float("inf"),
             reason=(
-                "No available node is capable of executing "
-                "the requested workload"
+                reason
+                or (
+                    "No available node is capable of "
+                    "executing the requested workload"
+                )
             ),
             fallback_used=False,
             candidates=(),

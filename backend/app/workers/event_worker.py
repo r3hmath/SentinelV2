@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.database.postgres import postgres
 from app.database.redis import redis_client
@@ -24,6 +24,145 @@ CONSUMER_NAME = os.getenv(
 BLOCK_MS = 5000
 
 BATCH_SIZE = 10
+
+
+async def check_watchlist_and_alert(
+    event_id: UUID,
+    node_id: str,
+    camera_id: str,
+    latitude: float | None,
+    longitude: float | None,
+    confidence: float,
+    timestamp: datetime,
+    stored_metadata: dict,
+):
+    """
+    Cross-reference ALPR detection with eGujCop Watchlist (Redis Set + PostgreSQL).
+    If a match is found, creates a THREAT_DETECTED event and broadcasts via Redis Pub/Sub.
+    """
+    alpr_meta = stored_metadata.get("alpr", {})
+    plate = (
+        alpr_meta.get("plate")
+        or stored_metadata.get("license_plate")
+        or stored_metadata.get("plate")
+    )
+
+    if not plate:
+        return
+
+    normalized_plate = str(plate).strip().upper()
+
+    # 1. Fast O(1) Redis set check
+    is_on_watchlist = False
+    if redis_client.client:
+        try:
+            is_on_watchlist = await redis_client.client.sismember(
+                "egujcop_watchlist", normalized_plate
+            )
+        except Exception:
+            logger.exception("Redis watchlist check error; falling back to PostgreSQL")
+
+    # 2. Query PostgreSQL for complete details if matched or fallback
+    watchlist_item = None
+    try:
+        async with postgres.pool.acquire() as connection:
+            watchlist_item = await connection.fetchrow(
+                """
+                SELECT license_plate, vehicle_make, vehicle_model, vehicle_color,
+                       owner_name, category, severity, notes, flagged_by
+                FROM public.egujcop_watchlist
+                WHERE UPPER(license_plate) = UPPER($1)
+                """,
+                normalized_plate,
+            )
+    except Exception:
+        logger.exception("PostgreSQL watchlist query error")
+
+    if watchlist_item:
+        logger.warning(
+            "🚨 eGujCop THREAT DETECTED | Plate: %s | Category: %s | Severity: %s | Camera: %s",
+            normalized_plate,
+            watchlist_item["category"],
+            watchlist_item["severity"],
+            camera_id,
+        )
+
+        threat_id = uuid4()
+        threat_payload = {
+            "event_type": "THREAT_DETECTED",
+            "alert_id": str(threat_id),
+            "license_plate": normalized_plate,
+            "category": watchlist_item["category"],
+            "severity": watchlist_item["severity"],
+            "owner_name": watchlist_item["owner_name"],
+            "vehicle_info": f"{watchlist_item.get('vehicle_color', '')} {watchlist_item.get('vehicle_make', '')} {watchlist_item.get('vehicle_model', '')}".strip(),
+            "notes": watchlist_item["notes"],
+            "flagged_by": watchlist_item["flagged_by"],
+            "camera_id": camera_id,
+            "node_id": node_id,
+            "latitude": latitude,
+            "longitude": longitude,
+            "timestamp": timestamp.isoformat(),
+            "confidence": confidence,
+            "source_event_id": str(event_id),
+        }
+
+        # Persist THREAT_DETECTED event in PostgreSQL
+        try:
+            async with postgres.pool.acquire() as connection:
+                geom_sql = (
+                    "ST_SetSRID(ST_MakePoint($7, $6), 4326)"
+                    if (latitude is not None and longitude is not None)
+                    else "NULL"
+                )
+                await connection.execute(
+                    f"""
+                    INSERT INTO public.events (
+                        event_id,
+                        node_id,
+                        camera_id,
+                        event_type,
+                        confidence,
+                        event_timestamp,
+                        latitude,
+                        longitude,
+                        geom,
+                        inference_latency_ms,
+                        metadata,
+                        processing_status,
+                        processing_attempts,
+                        processed_at
+                    )
+                    VALUES (
+                        $1, $2, $3, 'THREAT_DETECTED', $4, $5, $6, $7,
+                        {geom_sql}, 25.0, $8::jsonb, 'processed', 1, NOW()
+                    )
+                    ON CONFLICT (event_id) DO NOTHING
+                    """,
+                    threat_id,
+                    node_id,
+                    camera_id,
+                    confidence,
+                    timestamp,
+                    latitude,
+                    longitude,
+                    json.dumps(threat_payload),
+                )
+        except Exception:
+            logger.exception("Failed to insert THREAT_DETECTED into database")
+
+        # Broadcast via Redis Pub/Sub to all connected WebSockets
+        if redis_client.client:
+            try:
+                await redis_client.client.publish(
+                    "sentinel:alerts", json.dumps(threat_payload)
+                )
+                logger.info(
+                    "Broadcasted THREAT_DETECTED alert to 'sentinel:alerts' channel | plate=%s",
+                    normalized_plate,
+                )
+            except Exception:
+                logger.exception("Failed to publish alert to Redis Pub/Sub")
 
 
 async def create_consumer_group():
@@ -133,10 +272,16 @@ async def save_event(event_data: dict):
         **metadata,
     }
 
+    geom_expr = (
+        "ST_SetSRID(ST_MakePoint($8, $7), 4326)"
+        if (latitude is not None and longitude is not None)
+        else "NULL"
+    )
+
     async with postgres.pool.acquire() as connection:
 
         await connection.execute(
-            """
+            f"""
             INSERT INTO public.events (
                 event_id,
                 node_id,
@@ -146,6 +291,7 @@ async def save_event(event_data: dict):
                 event_timestamp,
                 latitude,
                 longitude,
+                geom,
                 frame_number,
                 inference_latency_ms,
                 metadata,
@@ -163,6 +309,7 @@ async def save_event(event_data: dict):
                 $6,
                 $7,
                 $8,
+                {geom_expr},
                 $9,
                 $10,
                 $11::jsonb,
@@ -198,6 +345,19 @@ async def save_event(event_data: dict):
             json.dumps(
                 stored_metadata
             ),
+        )
+
+    # If this is an ALPR detection, check against eGujCop watchlist
+    if event_type == "ALPR_DETECTED":
+        await check_watchlist_and_alert(
+            event_id=event_id,
+            node_id=node_id,
+            camera_id=camera_id,
+            latitude=latitude,
+            longitude=longitude,
+            confidence=confidence,
+            timestamp=timestamp,
+            stored_metadata=stored_metadata,
         )
 
 
@@ -303,9 +463,31 @@ async def process_pending_messages():
     )
 
 
+async def sync_watchlist_cache():
+    """
+    Sync all active watchlist plates from PostgreSQL into Redis in-memory set (egujcop_watchlist)
+    for O(1) matching during stream processing.
+    """
+    if not redis_client.client or not postgres.pool:
+        return
+    try:
+        async with postgres.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT UPPER(license_plate) as plate FROM public.egujcop_watchlist")
+            if rows:
+                plates = [r["plate"] for r in rows]
+                await redis_client.client.sadd("egujcop_watchlist", *plates)
+                logger.info(
+                    "Synchronized %d watchlist plates into Redis Set 'egujcop_watchlist'",
+                    len(plates),
+                )
+    except Exception:
+        logger.exception("Failed to synchronize watchlist into Redis cache")
+
+
 async def worker_loop():
 
     await create_consumer_group()
+    await sync_watchlist_cache()
 
     logger.info(
         "Sentinel Event Worker started | consumer=%s",
@@ -317,6 +499,7 @@ async def worker_loop():
     # ----------------------------------
 
     await process_pending_messages()
+
 
     # ----------------------------------
     # Process new events

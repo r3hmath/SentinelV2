@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sentinel_edge.offload.models import NodeHealth, WorkloadProfile
+from sentinel_edge.offload.models import (
+    AdaptiveDecisionExplanation,
+    NodeHealth,
+    WorkloadProfile,
+)
 from sentinel_edge.offload.policy import SchedulingPolicy
 from sentinel_edge.offload.telemetry import (
     ExecutionStatistics,
@@ -35,7 +39,9 @@ class AdaptivePolicyConfig:
 
     def __post_init__(self) -> None:
         if self.minimum_samples <= 0:
-            raise ValueError("minimum_samples must be greater than zero")
+            raise ValueError(
+                "minimum_samples must be greater than zero"
+            )
 
         if self.latency_penalty_weight < 0:
             raise ValueError(
@@ -90,13 +96,17 @@ class AdaptiveSchedulingPolicy:
     Decorates SchedulingPolicy with execution-telemetry feedback.
 
     The base scheduling policy remains responsible for:
+
         - capability checks
         - latency estimation
         - base scoring
         - human-readable scheduling reasons
 
-    This class only modifies the score using observed execution
-    performance.
+    This class adds:
+
+        - adaptive score adjustment
+        - telemetry-based explanation
+        - score/explanation consistency
 
     If telemetry is unavailable or insufficient, the base policy is
     preserved unchanged.
@@ -108,19 +118,31 @@ class AdaptiveSchedulingPolicy:
         telemetry_collector: ExecutionTelemetryCollector | None = None,
         config: AdaptivePolicyConfig | None = None,
     ) -> None:
-        self.base_policy = base_policy or SchedulingPolicy()
+        self.base_policy = (
+            base_policy
+            or SchedulingPolicy()
+        )
+
         self.telemetry_collector = telemetry_collector
-        self.config = config or AdaptivePolicyConfig()
+
+        self.config = (
+            config
+            or AdaptivePolicyConfig()
+        )
+
+    def validate_workload(
+        self,
+        workload: WorkloadProfile,
+    ) -> bool:
+        return self.base_policy.validate_workload(
+            workload,
+        )
 
     def is_capable(
         self,
         node: NodeHealth,
         workload: WorkloadProfile,
     ) -> bool:
-        """
-        Delegate capability decisions to the base policy.
-        """
-
         return self.base_policy.is_capable(
             node,
             workload,
@@ -131,12 +153,6 @@ class AdaptiveSchedulingPolicy:
         node: NodeHealth,
         workload: WorkloadProfile,
     ) -> float:
-        """
-        Delegate latency estimation to the base policy.
-
-        Telemetry feedback currently affects ranking score only.
-        """
-
         return self.base_policy.estimate_latency(
             node,
             workload,
@@ -147,13 +163,6 @@ class AdaptiveSchedulingPolicy:
         node: NodeHealth,
         workload: WorkloadProfile,
     ) -> str:
-        """
-        Delegate the scheduling explanation to the base policy.
-
-        Adaptive feedback changes the ranking score, but the existing
-        policy remains the source of the human-readable reason.
-        """
-
         return self.base_policy.reason(
             node,
             workload,
@@ -165,7 +174,29 @@ class AdaptiveSchedulingPolicy:
         workload: WorkloadProfile,
     ) -> float:
         """
-        Return the base score adjusted by observed execution telemetry.
+        Return the adaptive score.
+
+        The score is derived from the same explanation object exposed
+        by explain(), ensuring that observability cannot disagree with
+        the actual scheduling score.
+        """
+
+        return self.explain(
+            node,
+            workload,
+        ).final_score
+
+    def explain(
+    self,
+    node: NodeHealth,
+    workload: WorkloadProfile,
+) -> AdaptiveDecisionExplanation:
+        """
+        Explain exactly how telemetry influenced the node score.
+
+        The explanation is the single source of truth for the adaptive
+        score. Individual adjustments are scaled together when the
+        configured total adjustment bounds would otherwise be exceeded.
         """
 
         base_score = self.base_policy.score(
@@ -174,18 +205,85 @@ class AdaptiveSchedulingPolicy:
         )
 
         if base_score == float("-inf"):
-            return base_score
+            return AdaptiveDecisionExplanation(
+                node_id=node.node_id,
+                target=node.target,
+                base_score=base_score,
+                latency_adjustment=0.0,
+                reliability_adjustment=0.0,
+                adaptive_adjustment=0.0,
+                final_score=base_score,
+                telemetry_samples=0,
+                success_rate=0.0,
+                average_latency_ms=0.0,
+                adaptation_active=False,
+            )
 
-        adjustment = self.telemetry_adjustment(
+        (
+            latency_adjustment,
+            reliability_adjustment,
+            statistics,
+            adaptation_active,
+        ) = self._telemetry_components(
             node,
             workload,
         )
 
-        adaptive_score = base_score + adjustment
+        raw_adjustment = (
+            latency_adjustment
+            + reliability_adjustment
+        )
 
-        return max(
+        bounded_adjustment = max(
+            -self.config.maximum_penalty,
+            min(
+                self.config.maximum_bonus,
+                raw_adjustment,
+            ),
+        )
+
+        # Keep the explanation mathematically consistent:
+        #
+        # adaptive_adjustment =
+        #     latency_adjustment + reliability_adjustment
+        #
+        # If the combined adjustment exceeds the configured bound,
+        # scale both components proportionally instead of clamping only
+        # the combined value.
+        if (
+            raw_adjustment != 0.0
+            and bounded_adjustment != raw_adjustment
+        ):
+            scale = bounded_adjustment / raw_adjustment
+
+            latency_adjustment *= scale
+            reliability_adjustment *= scale
+
+        adaptive_adjustment = (
+            latency_adjustment
+            + reliability_adjustment
+        )
+
+        final_score = max(
             0.0,
-            min(1.0, adaptive_score),
+            min(
+                1.0,
+                base_score + adaptive_adjustment,
+            ),
+        )
+
+        return AdaptiveDecisionExplanation(
+            node_id=node.node_id,
+            target=node.target,
+            base_score=base_score,
+            latency_adjustment=latency_adjustment,
+            reliability_adjustment=reliability_adjustment,
+            adaptive_adjustment=adaptive_adjustment,
+            final_score=final_score,
+            telemetry_samples=statistics.executions,
+            success_rate=statistics.success_rate,
+            average_latency_ms=statistics.average_latency_ms,
+            adaptation_active=adaptation_active,
         )
 
     def telemetry_adjustment(
@@ -197,8 +295,30 @@ class AdaptiveSchedulingPolicy:
         Calculate bounded telemetry feedback for a node/workload pair.
         """
 
+        return self.explain(
+            node,
+            workload,
+        ).adaptive_adjustment
+    
+
+    def _telemetry_components(
+        self,
+        node: NodeHealth,
+        workload: WorkloadProfile,
+    ) -> tuple[
+        float,
+        float,
+        ExecutionStatistics,
+        bool,
+    ]:
+    
         if self.telemetry_collector is None:
-            return 0.0
+            return (
+                0.0,
+                0.0,
+                self._empty_statistics(),
+                False,
+            )
 
         statistics = self.telemetry_collector.statistics(
             node_id=node.node_id,
@@ -206,7 +326,12 @@ class AdaptiveSchedulingPolicy:
         )
 
         if statistics.executions < self.config.minimum_samples:
-            return 0.0
+            return (
+                0.0,
+                0.0,
+                statistics,
+                False,
+            )
 
         latency_adjustment = self._latency_adjustment(
             workload,
@@ -217,18 +342,25 @@ class AdaptiveSchedulingPolicy:
             statistics,
         )
 
-        adjustment = (
-            latency_adjustment
-            + reliability_adjustment
+        return (
+            latency_adjustment,
+            reliability_adjustment,
+            statistics,
+            True,
         )
-
-        return max(
-            -self.config.maximum_penalty,
-            min(
-                self.config.maximum_bonus,
-                adjustment,
-            ),
-        )
+    def _empty_statistics(self) -> ExecutionStatistics:
+        """Return empty telemetry statistics."""
+        return ExecutionStatistics(
+        executions=0,
+        successful=0,
+        failed=0,
+        success_rate=0.0,
+        average_latency_ms=0.0,
+        p95_latency_ms=0.0,
+        min_latency_ms=0.0,
+        max_latency_ms=0.0,
+        last_execution_at=None,
+    )
 
     def _latency_adjustment(
         self,
@@ -242,10 +374,18 @@ class AdaptiveSchedulingPolicy:
 
         observed_latency = statistics.average_latency_ms
 
-        ratio = observed_latency / expected_latency
+        ratio = (
+            observed_latency
+            / expected_latency
+        )
 
-        healthy_ratio = self.config.healthy_latency_ratio
-        poor_ratio = self.config.poor_latency_ratio
+        healthy_ratio = (
+            self.config.healthy_latency_ratio
+        )
+
+        poor_ratio = (
+            self.config.poor_latency_ratio
+        )
 
         if ratio <= healthy_ratio:
             return (
@@ -280,47 +420,40 @@ class AdaptiveSchedulingPolicy:
         )
 
     def _reliability_adjustment(
-        self,
-        statistics: ExecutionStatistics,
-    ) -> float:
+    self,
+    statistics: ExecutionStatistics,
+) -> float:
         """
         Calculate reliability feedback with evidence-aware scaling.
 
-        A small number of failures should not immediately produce the
-        maximum scheduling penalty. As failures accumulate, the penalty
-        approaches the configured maximum reliability penalty.
-
-        This prevents short-lived/transient failures from destabilizing
-        scheduling decisions while still allowing persistent failures
-        to strongly influence ranking.
+        Healthy execution history receives a positive reliability bonus.
+        Failure penalties increase with observed failure evidence rather
+        than immediately applying the maximum penalty.
         """
 
         if statistics.executions <= 0:
             return 0.0
 
         success_rate = statistics.success_rate
+
         healthy_rate = self.config.healthy_success_rate
         poor_rate = self.config.poor_success_rate
 
-        if success_rate >= healthy_rate:
-            return (
-                self.config.failure_penalty_weight
-                * 0.10
-            )
+        healthy_adjustment = (
+            self.config.failure_penalty_weight * 0.10
+        )
 
-        if success_rate > poor_rate:
+        poor_adjustment = (
+            -self.config.failure_penalty_weight
+        )
+
+        if success_rate >= healthy_rate:
+            raw_adjustment = healthy_adjustment
+
+        elif success_rate > poor_rate:
             progress = (
                 (success_rate - poor_rate)
                 / (healthy_rate - poor_rate)
-            )
-
-            healthy_adjustment = (
-                self.config.failure_penalty_weight
-                * 0.10
-            )
-
-            poor_adjustment = (
-                -self.config.failure_penalty_weight
             )
 
             raw_adjustment = (
@@ -331,17 +464,23 @@ class AdaptiveSchedulingPolicy:
                     - poor_adjustment
                 )
             )
-        else:
-            raw_adjustment = -self.config.failure_penalty_weight
 
-        # Scale the penalty according to the amount of failure evidence.
-        #
-        # One failure should not immediately destabilize scheduling.
-        # Once failures reach minimum_samples, the full reliability
-        # penalty is allowed.
-        evidence_factor = min(
-            1.0,
-            statistics.failed / self.config.minimum_samples,
-        )
+        else:
+            raw_adjustment = poor_adjustment
+
+        # Positive reliability evidence needs successful executions.
+        # Negative reliability evidence needs observed failures.
+        if raw_adjustment > 0.0:
+            evidence_factor = min(
+                1.0,
+                statistics.executions
+                / self.config.minimum_samples,
+            )
+        else:
+            evidence_factor = min(
+                1.0,
+                statistics.failed
+                / self.config.minimum_samples,
+            )
 
         return raw_adjustment * evidence_factor

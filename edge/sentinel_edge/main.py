@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -1369,30 +1370,41 @@ def process_camera(
     )
 
     # --------------------------------------------------------
-    # Camera
-    # --------------------------------------------------------
-
-    stream = CameraStream(camera.source)
-    stream.open()
-
-    # --------------------------------------------------------
     # Tracking State
     # --------------------------------------------------------
 
     state_manager = TrackStateManager(
-
         max_missing_frames=(
             config.inference.max_missing_frames
         ),
-
         event_update_interval_seconds=(
             config.inference.event_update_interval_seconds
         ),
-
         min_track_observations=(
             config.inference.min_track_observations
         ),
     )
+
+    def on_discontinuity():
+        logger.warning(
+            "[%s] Monotonic PTS loop cut detected — resetting ByteTrack & TrackStateManager",
+            camera.id,
+        )
+        tracker.reset()
+        state_manager.reset()
+
+    # --------------------------------------------------------
+    # Camera
+    # --------------------------------------------------------
+
+    stream = CameraStream(
+        source=camera.source,
+        camera_id=camera.id,
+        buffer_size=1,
+        loop_video=True,
+        on_pts_reset=on_discontinuity,
+    )
+    stream.open()
 
     # --------------------------------------------------------
     # Behavior Engine
@@ -1565,10 +1577,10 @@ def process_camera(
         while True:
 
             # ------------------------------------------------
-            # Read frame
+            # Read frame with monotonic PTS timing
             # ------------------------------------------------
 
-            success, frame = stream.read()
+            success, frame, pts_ms = stream.read(with_pts=True)
 
             if not success:
 
@@ -1600,7 +1612,12 @@ def process_camera(
                 frame
             )
 
-            timestamp = datetime.now(timezone.utc)
+            # Strict Monotonic PTS Frame Presentation Timing (zero wall-clock drift)
+            timestamp = (
+                datetime.fromtimestamp(pts_ms / 1000.0, tz=timezone.utc)
+                if pts_ms > 0
+                else datetime.now(timezone.utc)
+            )
 
             # ------------------------------------------------
             # Update TrackState
@@ -2042,53 +2059,55 @@ def main():
 
     try:
 
-        for camera in config.cameras:
+        enabled_cameras = [
+            camera for camera in config.cameras if camera.enabled
+        ]
 
-            if not camera.enabled:
-                continue
-
-            # ------------------------------------------------
-            # Separate tracker per camera
-            # ------------------------------------------------
-
-            tracker = VehicleTracker(
-
-                model_path=(
-                    config.inference.model_path
-                ),
-
-                confidence=(
-                    config.inference.confidence
-                ),
-
-                classes=(
-                    config.inference.classes
-                ),
-
-                tracker=(
-                    config.inference.tracker
-                ),
-
-                image_size=(
-                    config.inference.image_size
-                ),
+        if len(enabled_cameras) <= 1:
+            for camera in enabled_cameras:
+                tracker = VehicleTracker(
+                    model_path=config.inference.model_path,
+                    confidence=config.inference.confidence,
+                    classes=config.inference.classes,
+                    tracker=config.inference.tracker,
+                    image_size=config.inference.image_size,
+                )
+                process_camera(
+                    camera=camera,
+                    config=config,
+                    tracker=tracker,
+                    event_client=event_client,
+                    offload_scheduler=offload_scheduler,
+                )
+        else:
+            logger.info(
+                "Launching %d cameras concurrently...",
+                len(enabled_cameras),
             )
-
-            # ------------------------------------------------
-            # Process camera
-            # ------------------------------------------------
-
-            process_camera(
-
-                camera=camera,
-
-                config=config,
-
-                tracker=tracker,
-
-                event_client=event_client,
-                offload_scheduler=offload_scheduler,
-            )
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(32, len(enabled_cameras)),
+                thread_name_prefix="CamWorker",
+            ) as executor:
+                futures = []
+                for camera in enabled_cameras:
+                    tracker = VehicleTracker(
+                        model_path=config.inference.model_path,
+                        confidence=config.inference.confidence,
+                        classes=config.inference.classes,
+                        tracker=config.inference.tracker,
+                        image_size=config.inference.image_size,
+                    )
+                    futures.append(
+                        executor.submit(
+                            process_camera,
+                            camera=camera,
+                            config=config,
+                            tracker=tracker,
+                            event_client=event_client,
+                            offload_scheduler=offload_scheduler,
+                        )
+                    )
+                concurrent.futures.wait(futures)
 
     finally:
 
