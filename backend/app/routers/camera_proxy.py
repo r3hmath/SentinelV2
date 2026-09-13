@@ -96,3 +96,25 @@ async def get_sandbox_cameras(
             status_code=503,
             detail=f"Unable to reach Sentinel Sandbox gateway at {sandbox_host}: {str(exc)}",
         )
+
+
+@router.post("/ingest")
+async def post_sandbox_cameras_ingest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Proxy / Direct ingest handler for /api/v1/cameras/ingest telemetry.
+    """
+    camera_id = payload.get("camera_id") or payload.get("id") or "UNKNOWN_CAM"
+    frame_number = payload.get("frame_number", 0)
+    logger.info(
+        "Direct camera ingest telemetry accepted | camera_id=%s | frame=%s",
+        camera_id,
+        frame_number,
+    )
+    return {
+        "status": "accepted",
+        "endpoint": "/api/v1/cameras/ingest",
+        "camera_id": camera_id,
+        "frame_number": frame_number,
+        "timestamp": payload.get("timestamp"),
+    }
+

@@ -10,7 +10,7 @@ from pydantic_settings import (
 # sentinel_phase1/
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-ENV_FILE = PROJECT_ROOT / ".env.example"
+ENV_FILE = PROJECT_ROOT / ".env" if (PROJECT_ROOT / ".env").exists() else PROJECT_ROOT / ".env.example"
 
 
 class Settings(BaseSettings):

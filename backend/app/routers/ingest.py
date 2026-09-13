@@ -110,3 +110,29 @@ async def discover_ingest_topology(
         "district_filter": district_id,
         "cameras": cameras_list,
     }
+
+
+@router.post("/ingest")
+@router.post("/api/ingest")
+@router.post("/api/v1/ingest")
+async def receive_ingest_telemetry(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sentinel Live Stream Ingestion & Telemetry Endpoint.
+    Accepts normalized spatial metadata, frame statistics, and detection telemetry.
+    """
+    camera_id = payload.get("camera_id") or payload.get("id") or "UNKNOWN_CAM"
+    frame_number = payload.get("frame_number", 0)
+    logger.info(
+        "Ingestion telemetry received | camera_id=%s | frame=%s | source=%s",
+        camera_id,
+        frame_number,
+        payload.get("source", "UNKNOWN"),
+    )
+    return {
+        "status": "accepted",
+        "camera_id": camera_id,
+        "frame_number": frame_number,
+        "timestamp": payload.get("timestamp"),
+        "message": "Ingest telemetry accepted successfully",
+    }
+

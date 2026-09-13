@@ -68,3 +68,47 @@ Node-specific values now live in:
 `edge/config/node.yaml`
 
 Do not hardcode camera IDs, coordinates, backend URLs, or database credentials inside Python source files.
+
+---
+
+## Phase 2: Live CCTV Ingestion & Vehicle Re-ID Infrastructure
+
+### 1. Mock RTSP Streaming Setup (Local Development)
+
+To test the live ingestion worker without live government CCTV endpoints, run a local RTSP server using **MediaMTX** (formerly `rtsp-simple-server`) and loop a sample video file from `edge/media/`:
+
+#### Option A: Running MediaMTX via Docker
+```bash
+docker run --rm -it -e MTX_PROTOCOLS=tcp -p 8554:8554 bluenviron/mediamtx
+```
+
+#### Option B: Looping Sample Video Stream to Mock RTSP via FFmpeg
+Once MediaMTX is running on port 8554, publish a continuous looped stream using FFmpeg:
+```bash
+ffmpeg -re -stream_loop -1 -i edge/media/ahmd.mp4 -c copy -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/live/CAM_AHM_01
+```
+
+### 2. Environment Configuration
+Configure the RTSP stream URL dynamically via the `CAMERA_RTSP_URL` environment variable:
+```bash
+# Windows PowerShell
+$env:CAMERA_RTSP_URL="rtsp://127.0.0.1:8554/live/CAM_AHM_01"
+
+# Linux / macOS
+export CAMERA_RTSP_URL="rtsp://127.0.0.1:8554/live/CAM_AHM_01"
+```
+
+### 3. Running the Ingestion Worker
+```bash
+python edge/ingest_gujarat_live.py --camera-id CAM_AHM_01 --city Ahmedabad --fps 5.0
+```
+
+### 4. Running the Vehicle Re-ID Engine
+```bash
+# Pairwise vehicle crop comparison (Cosine Similarity & Euclidean Distance)
+python edge/reid_engine.py --image edge/media/sample_vehicle.jpg --compare edge/media/sample_vehicle_enhanced.jpg
+
+# Watchlist matching with synthetic/live PostGIS database
+python edge/reid_engine.py --image edge/media/sample_vehicle.jpg --threshold 0.75
+```
+
